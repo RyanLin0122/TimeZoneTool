@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>World Time Hover Tool</title>
+
+  <!-- Bootstrap -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+
+  <!-- Leaflet -->
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+
+  <!-- Luxon (timezone-aware via IANA zone names) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/luxon/3.7.2/luxon.min.js"></script>
+
+  <!-- tz-lookup (lat/lon -> IANA timezone) -->
+  <script src="https://cdn.jsdelivr.net/npm/tz-lookup@6.1.25/tz.js"></script>
+
+  <!-- p5.js for HUD overlay -->
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #app {
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+    #map { height: 100%; }
+    .topbar {
+      border-bottom: 1px solid rgba(0,0,0,.08);
+      background: #fff;
+      z-index: 1000;
+    }
+    /* p5 canvas overlay on top of leaflet */
+    #hud {
+      position: absolute;
+      top: 64px; /* roughly below navbar */
+      left: 0;
+      width: 100%;
+      height: calc(100% - 64px);
+      pointer-events: none; /* let mouse go through */
+      z-index: 999;
+    }
+    .map-wrap {
+      position: relative;
+      height: 100%;
+    }
+  </style>
+</head>
+
+<body>
+<div id="app">
+  <div class="topbar px-3 py-2 d-flex align-items-center justify-content-between">
+    <div class="fw-semibold">World Time Hover Tool</div>
+    <div class="text-secondary small">
+      滑鼠移到國家上方 → 顯示該點所在時區的目前時間（含 DST）
+    </div>
+  </div>
+
+  <div class="map-wrap">
+    <div id="map"></div>
+    <div id="hud"></div>
+  </div>
+</div>
+
+<script>
+  const { DateTime } = luxon;
+
+  // --- Shared state for HUD (p5 will read these) ---
+  const HUD_STATE = {
+    visible: false,
+    country: "—",
+    tz: "—",
+    timeText: "—",
+    lat: null,
+    lng: null
+  };
+  function normalizeLng(lng) {
+    // 轉成 [-180, 180)
+    return ((((lng + 180) % 360) + 360) % 360) - 180;
+  }
+  
+  function formatLon(lng) {
+    const n = normalizeLng(lng);
+    const hemi = n === 0 ? "" : (n > 0 ? "E" : "W");
+    return `${Math.abs(n).toFixed(2)}°${hemi}`;
+  }
+  
+  const regionNamesZhHant =
+  (typeof Intl !== "undefined" && Intl.DisplayNames)
+    ? new Intl.DisplayNames(["zh-Hant"], { type: "region" })
+    : null;
+
+  function pickIso2(props) {
+    // 你的資料實際欄位是 iso_a2（小寫），同時保留其他可能欄位做 fallback
+    const candidates = [
+      props?.iso_a2,     // ✅ 你這份資料用這個
+      props?.wb_a2,
+      props?.ISO_A2,
+      props?.ISO_A2_EH,
+      props?.WB_A2
+    ];
+  
+    for (const v of candidates) {
+      const iso2 = (v ?? "").toString().trim().toUpperCase();
+      if (iso2 && iso2 !== "-99") return iso2;
+    }
+    return "";
+  }
+  
+  function getCountryNameZhHant(props) {
+    const iso2 = pickIso2(props);
+  
+    if (regionNamesZhHant && iso2) {
+      const zh = regionNamesZhHant.of(iso2);
+      if (zh) return zh;
+    }
+  
+    // fallback：翻不到就用你資料裡的英文名稱
+    return props?.admin || props?.name || props?.name_long || props?.abbrev || "未知";
+  }
+
+
+  function usTimeZoneLabel(ianaZone) {
+    // 依 IANA zone 粗略映射到常見美國時區名（更易讀）
+    // 不是「州級」精準判斷（那需要更細緻的行政區資料），但對一般使用足夠。
+    if (!ianaZone) return null;
+  
+    // Hawaii
+    if (ianaZone === "Pacific/Honolulu") return "Hawaii Time (HST)";
+    // Alaska
+    if (ianaZone.startsWith("America/Anchorage") || ianaZone.startsWith("America/Juneau") ||
+        ianaZone.startsWith("America/Sitka") || ianaZone.startsWith("America/Nome") ||
+        ianaZone.startsWith("America/Yakutat")) return "Alaska Time (AKT)";
+  
+    // Pacific
+    if (ianaZone === "America/Los_Angeles" || ianaZone === "America/Vancouver" ||
+        ianaZone === "America/Tijuana") return "Pacific Time (PT)";
+  
+    // Mountain
+    if (ianaZone === "America/Denver" || ianaZone === "America/Phoenix" ||
+        ianaZone.startsWith("America/Boise")) return "Mountain Time (MT)";
+  
+    // Central
+    if (ianaZone === "America/Chicago" || ianaZone === "America/Winnipeg" ||
+        ianaZone === "America/Mexico_City") return "Central Time (CT)";
+  
+    // Eastern
+    if (ianaZone === "America/New_York" || ianaZone === "America/Toronto" ||
+        ianaZone === "America/Nassau") return "Eastern Time (ET)";
+  
+    // 其他美國區域（例如 Puerto Rico, Guam 等）
+    if (ianaZone.startsWith("America/")) return "US / Americas Time Zone";
+    if (ianaZone.startsWith("Pacific/")) return "Pacific Region Time Zone";
+  
+    return null;
+  }
+
+  // --- Leaflet map ---
+  const map = L.map('map', {
+    worldCopyJump: false
+  }).setView([20, 0], 2);
+
+  const bounds = L.latLngBounds(
+    L.latLng(-85, -180),
+    L.latLng( 85,  180)
+    );
+  map.setMaxBounds(bounds);
+  map.options.maxBoundsViscosity = 1.0; // 黏住邊界，避免拖出去
+  // Basemap (OSM tiles)
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 8,
+    noWrap: true,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+
+  // Country boundary GeoJSON (Natural Earth converted to GeoJSON)
+  // 這份 repo 是常用的 Natural Earth GeoJSON 轉檔版
+  const COUNTRIES_GEOJSON_URL =
+    "https://d2ad6b4ur7yvpq.cloudfront.net/naturalearth-3.3.0/ne_110m_admin_0_countries.geojson";
+
+  const lines = [
+    `國家：${HUD_STATE.country}`,
+    `時區：${HUD_STATE.tz}`,
+    `目前時間：${HUD_STATE.timeText}`,
+    HUD_STATE.extra ? HUD_STATE.extra : ""
+  ].filter(Boolean);
+
+  // 垂直虛線經線（跟著滑鼠經度）
+  const meridianLine = L.polyline([[-85, 0], [85, 0]], {
+    color: '#111827',
+    weight: 1,
+    opacity: 0.6,
+    dashArray: '6 6',
+    interactive: false
+  }).addTo(map);
+
+  map.on('mousemove', (e) => {
+    const lng = normalizeLng(e.latlng.lng);
+    meridianLine.setLatLngs([[-85, lng], [85, lng]]);
+  });
+
+  function formatZhTime(dt) {
+    // 你要「幾月幾號幾點幾分」：用 M月d日 HH:mm
+    return dt.toFormat("M月d日 HH:mm");
+  }
+
+  function safeTzLookup(lat, lng) {
+    try {
+      // tz-lookup 會在 window.tzlookup 或 window.tz 之類暴露（依 bundle）
+      // 在 jsdelivr 的 tz-lookup@6.1.25/tz.js 內，通常是 tzlookup(lat,lng)
+      if (typeof tzlookup === "function") return tzlookup(lat, lng);
+      if (typeof tz === "function") return tz(lat, lng);
+      throw new Error("tz-lookup global function not found");
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function updateHud(countryName, lat, lng) {
+    const zone = safeTzLookup(lat, lng);
+    HUD_STATE.visible = true;
+    HUD_STATE.country = countryName || "—";
+    HUD_STATE.lat = lat;
+    HUD_STATE.lng = lng;
+  
+    if (!zone) {
+      HUD_STATE.tz = "（無法推斷時區）";
+      HUD_STATE.timeText = "—";
+      HUD_STATE.extra = `經度：${formatLon(lng)}`;
+      return;
+    }
+  
+    const dt = DateTime.now().setZone(zone);
+  
+    const offsetText = dt.toFormat("ZZ");             // e.g. +08:00
+    const abbr = dt.offsetNameShort;                  // e.g. PST, PDT, CST...
+    const dst = dt.isInDST ? "是" : "否";             // Luxon 提供
+    const localTime = dt.toFormat("M月d日 HH:mm");    // 你要的格式
+  
+    // 美國更詳細：加上常見美國時區名（ET/CT/MT/PT/AKT/HST）
+    const isUS = (countryName === "United States of America" || countryName === "United States" || /United States/i.test(countryName));
+    const usLabel = isUS ? usTimeZoneLabel(zone) : null;
+  
+    HUD_STATE.tz = zone;
+    HUD_STATE.timeText = localTime;
+  
+    const lines = [];
+    lines.push(`經度：${formatLon(lng)}`);
+    lines.push(`UTC offset：${offsetText}`);
+    if (abbr) lines.push(`縮寫：${abbr}`);
+    lines.push(`DST（夏令時間）：${dst}`);
+    if (usLabel) lines.push(`美國時區：${usLabel}`);
+  
+    HUD_STATE.extra = lines.join("｜");
+  }
+
+
+  function clearHud() {
+    HUD_STATE.visible = false;
+  }
+
+  // Styling
+  function defaultStyle() {
+    return {
+      weight: 1,
+      color: '#334155',
+      opacity: 0.6,
+      fillColor: '#94a3b8',
+      fillOpacity: 0.15
+    };
+  }
+
+  function highlightStyle() {
+    return {
+      weight: 2,
+      color: '#0f172a',
+      opacity: 0.9,
+      fillColor: '#38bdf8',
+      fillOpacity: 0.25
+    };
+  }
+
+  // Load countries
+  fetch(COUNTRIES_GEOJSON_URL)
+    .then(r => {
+      if (!r.ok) throw new Error("Failed to load GeoJSON");
+      return r.json();
+    })
+    .then(geojson => {
+      const layer = L.geoJSON(geojson, {
+        style: defaultStyle,
+        onEachFeature: (feature, lyr) => {
+        if (!window.__printedKeys) {
+          window.__printedKeys = true;
+          console.log("properties keys:", Object.keys(feature.properties || {}).sort());
+          console.log("sample properties:", feature.properties);
+        }
+        const props = feature.properties || {};
+        const countryName = getCountryNameZhHant(props);
+
+          lyr.on("mouseover", (e) => {
+            e.target.setStyle(highlightStyle());
+            const { lat, lng } = e.latlng;
+            updateHud(countryName, lat, lng);
+          });
+
+          lyr.on("mousemove", (e) => {
+            // 關鍵：用滑鼠所在點的 lat/lng 查時區
+            // 這樣多時區國家（美國、俄羅斯等）會跟著位置變
+            const { lat, lng } = e.latlng;
+            updateHud(countryName, lat, lng);
+          });
+
+          lyr.on("mouseout", (e) => {
+            layer.resetStyle(e.target);
+            clearHud();
+          });
+        }
+      }).addTo(map);
+
+      // Fit world bounds (optional)
+      // map.fitBounds(layer.getBounds(), { padding: [10, 10] });
+    })
+    .catch(err => {
+        console.error("GeoJSON load error:", err);
+        const msg =
+            "載入國界資料失敗。\n\n" +
+            "錯誤類型：" + (err?.name || "Unknown") + "\n" +
+            "錯誤訊息：" + (err?.message || String(err)) + "\n\n" +
+            "請到 DevTools → Network/Console 查看是否為 CORS（origin null）、404 或其他。";
+        alert(msg);
+        });
+
+  // --- p5 HUD overlay ---
+  new p5((p) => {
+    let cnv;
+
+    p.setup = () => {
+      const hudEl = document.getElementById("hud");
+      cnv = p.createCanvas(hudEl.clientWidth, hudEl.clientHeight);
+      cnv.parent("hud");
+      p.textFont("system-ui, -apple-system, Segoe UI, Roboto, Noto Sans TC, sans-serif");
+    };
+
+    p.windowResized = () => {
+      const hudEl = document.getElementById("hud");
+      p.resizeCanvas(hudEl.clientWidth, hudEl.clientHeight);
+    };
+
+    p.draw = () => {
+      p.clear();
+
+      if (!HUD_STATE.visible) return;
+
+      // 內容
+      const lines = [
+        `國家：${HUD_STATE.country}`,
+        `時區：${HUD_STATE.tz}`,
+        `目前時間：${HUD_STATE.timeText}`
+      ];
+
+      const pad = 14;
+      const lineH = 20;
+      const boxW = 360;
+      const boxH = pad * 2 + lineH * lines.length;
+
+      // 右上角卡片
+      const x = p.width - boxW - 18;
+      const y = 18;
+
+      // 背景
+      p.noStroke();
+      p.fill(255, 245);
+      p.rect(x, y, boxW, boxH, 14);
+
+      // 文字
+      p.fill(15, 23, 42);
+      p.textSize(14);
+      for (let i = 0; i < lines.length; i++) {
+        p.text(lines[i], x + pad, y + pad + lineH * (i + 0.8));
+      }
+    };
+  });
+</script>
+</body>
+</html>
