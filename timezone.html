@@ -357,20 +357,42 @@
       if (!HUD_STATE.visible) return;
 
       // 內容
-      const lines = [
+      const rawLines = [
         `國家：${HUD_STATE.country}`,
         `時區：${HUD_STATE.tz}`,
         `目前時間：${HUD_STATE.timeText}`
       ];
 
+      const minMargin = 12;
       const pad = 14;
-      const lineH = 20;
-      const boxW = 360;
+      const lineH = 22;
+      p.textSize(14);
+      const maxBoxW = Math.min(460, p.width - minMargin * 2);
+      const boxW = Math.max(220, maxBoxW);
+      const textMaxW = boxW - pad * 2;
+
+      // 手機螢幕長字串（時區）做自動換行，避免超出畫面
+      const lines = [];
+      for (const line of rawLines) {
+        const words = line.split("");
+        let current = "";
+        for (const ch of words) {
+          const candidate = current + ch;
+          if (p.textWidth(candidate) <= textMaxW || current.length === 0) {
+            current = candidate;
+          } else {
+            lines.push(current);
+            current = ch;
+          }
+        }
+        if (current) lines.push(current);
+      }
+
       const boxH = pad * 2 + lineH * lines.length;
 
-      // 右上角卡片
-      const x = p.width - boxW - 18;
-      const y = 18;
+      // 置中顯示（桌面/手機都保持在視窗中央）
+      const x = (p.width - boxW) / 2;
+      const y = (p.height - boxH) / 2;
 
       // 背景
       p.noStroke();
@@ -381,7 +403,7 @@
       p.fill(15, 23, 42);
       p.textSize(14);
       for (let i = 0; i < lines.length; i++) {
-        p.text(lines[i], x + pad, y + pad + lineH * (i + 0.8));
+        p.text(lines[i], x + pad, y + pad + lineH * (i + 0.75));
       }
     };
   });
